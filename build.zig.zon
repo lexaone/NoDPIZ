@@ -1,0 +1,20 @@
+.{
+    .name = .nodpiz,
+    .version = "0.1.0",
+    .dependencies = .{
+        .yazap = .{
+            .url = "git+https://github.com/prajwalch/yazap#fdb6a88e30bd7d27d548dd9f9809df8429f9f87b",
+            .hash = "yazap-0.6.3-Z1t-EhflAQCN128_OyQRyDcnbbVFPngvhwonpAHTq36h",
+        },
+    },
+    .fingerprint = 0x7c046fdd94262e55, // Changing this has security and trust implications.
+    // supported use case.
+    .minimum_zig_version = "0.15.0-dev.695+041eedc1c",
+    // .dependencies = .{
+    // },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
