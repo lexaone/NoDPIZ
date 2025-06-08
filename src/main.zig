@@ -15,7 +15,9 @@ const App = yazap.App;
 const Arg = yazap.Arg;
 
 var blocked_sites: ?[][]u8 = null;
-var allocator: std.mem.Allocator = undefined;
+var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+const allocator = arena.allocator();
+
 var random: Random = undefined;
 const ConnectionPair = struct {
     local: net.Stream,
@@ -35,28 +37,51 @@ const ConnectionPair = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    allocator = gpa.allocator();
+    defer arena.deinit();
 
+    var port_listen: u32 = PORT;
     var app = App.init(allocator, "nodpiz", "NoDPIZ proxy");
     defer app.deinit();
     var nodpiz = app.rootCommand();
-    // nodpiz.setProperty(.help_on_empty_args);
     try nodpiz.addArg(Arg.booleanOption("help", 'h', "Display help"));
     try nodpiz.addArg(Arg.booleanOption("version", 'v', "Display version"));
-    try nodpiz.addArg(Arg.singleValueOption("blacklist", 'b', "blacklist file with hosts to bypass,optional, default \n is bypass to all hosts"));
-    try nodpiz.addArg(Arg.singleValueOption("port", 'p', "Port Listening,optional, default is 8881"));
-    try nodpiz.addArg(Arg.singleValueOption("interface", 'i', "interface listening, ex: 127.0.0.1 or 0.0.0.0, optional,default is 127.0.0.1"));
 
+    var blacklist_opt = Arg.singleValueOption("blacklist", 'b', "blacklist file with hosts to bypass,optional, default \n is bypass to all hosts");
+    blacklist_opt.setValuePlaceholder("BLACKLIST_FILE");
+
+    var port_opt = Arg.singleValueOption("port", 'p', "Port Listening,optional, default is 8881");
+    port_opt.setValuePlaceholder("TCP_PORT");
+
+    var iface_opt = Arg.singleValueOption("iface", 'i', "interface listening, ex: 127.0.0.1 or 0.0.0.0, optional,default is 127.0.0.1");
+    iface_opt.setValuePlaceholder("IFACE");
+
+    try nodpiz.addArgs(&[_]Arg{ blacklist_opt, port_opt, iface_opt });
     const matches = try app.parseProcess();
 
     if (matches.containsArg("version")) {
-        print("v0.1.0\n", .{});
+        print("v0.2.0\n", .{});
         return;
     }
     if (matches.containsArg("help")) {
         try app.displayHelp();
+        return;
+    }
+    if (matches.getSingleValue("blacklist")) |blacklist_file_name| {
+        try loadBlacklist(allocator, blacklist_file_name);
+        // return;
+    }
+    if (matches.getSingleValue("port")) |port_str| {
+        // print("port : {s}\n", .{port});
+        port_listen = try std.fmt.parseUnsigned(u32, port_str, 10);
+        if (port_listen < 1024) {
+            return error.InvalidWordCount;
+        }
+        print("port_listen:{d}\n", .{port_listen});
+        // return;
+    }
+    if (matches.getSingleValue("iface")) |iface_str| {
+        // print("port : {s}\n", .{port});
+        print("interface listen:{s}\n", .{iface_str});
         return;
     }
     // Инициализация генератора случайных чисел
@@ -77,9 +102,6 @@ fn startProxy() !void {
         .reuse_address = true,
     });
     defer listener.deinit();
-
-    // print("Прокси запущено на 127.0.0.1:{}\n", .{PORT});
-    // print("Не закрывайте окно\n", .{});
 
     while (true) {
         const connection = listener.accept() catch |err| {
@@ -127,7 +149,6 @@ fn handleConnection(local_stream: net.Stream) !void {
         print("Поддерживается только CONNECT метод\n", .{});
         return;
     }
-    // print("target:{s}\n", .{target});
     // Парсинг host:port
     const colon_pos = std.mem.lastIndexOf(u8, target, ":") orelse {
         print("Неверный формат target: {s}\n", .{target});
@@ -135,13 +156,11 @@ fn handleConnection(local_stream: net.Stream) !void {
     };
 
     const host = target[0..colon_pos];
-    // print("host:{s}\n", .{host});
     const port_str = target[colon_pos + 1 ..];
     const port = std.fmt.parseInt(u16, port_str, 10) catch {
         print("Неверный порт: {s}\n", .{port_str});
         return;
     };
-    // print("port(int):{d}\n", .{port});
 
     // Подключение к удаленному серверу
     const remote_address = blk: {
@@ -249,21 +268,41 @@ fn fragmentData(local_stream: net.Stream, remote_stream: net.Stream) !void {
     _ = try remote_stream.writeAll(parts.items);
 }
 
-fn loadBlocklist() !void {
-    const file = std.fs.cwd().openFile("blacklist.txt", .{}) catch return;
+fn loadBlacklist(alloc: std.mem.Allocator, blacklist_file_name: []const u8) !void {
+    // Освобождаем предыдущий список сайтов
+    print("loadBlacklist.blacklist_file_name:{s}\n", .{blacklist_file_name});
+    if (blocked_sites) |sites| {
+        for (sites) |site| alloc.free(site);
+        alloc.free(sites);
+    }
+
+    const file = std.fs.cwd().openFile(blacklist_file_name, .{}) catch |err| {
+        print("Ошибка открытия файла {s}: {}\n", .{ blacklist_file_name, err });
+        return err;
+    };
     defer file.close();
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(content);
+    const content = try file.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
 
-    var sites = ArrayList([]u8).init(allocator);
-    var iter = std.mem.split(u8, content, " ");
-
-    while (iter.next()) |site| {
-        if (site.len > 0) {
-            const site_copy = try allocator.dupe(u8, site);
-            try sites.append(site_copy);
+    var sites = ArrayList([]u8).init(alloc);
+    defer {
+        if (sites.items.len > 0) {
+            for (sites.items) |site| alloc.free(site);
+            sites.deinit();
         }
+    }
+
+    var lines = std.mem.tokenizeAny(u8, content, "\n\r");
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+
+        print("loadBlacklist.trimmed:{s}\n", .{trimmed});
+        const site_copy = try alloc.dupe(u8, trimmed);
+        errdefer alloc.free(site_copy); // Освобождение при ошибке
+
+        try sites.append(site_copy);
     }
 
     blocked_sites = try sites.toOwnedSlice();
