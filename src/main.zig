@@ -209,8 +209,6 @@ fn pipe(pair: *ConnectionPair, local_to_remote: bool) void {
 
         _ = destination.writeAll(buffer[0..bytes_read]) catch break;
     }
-
-    pair.close();
 }
 
 fn fragmentData(local_stream: net.Stream, remote_stream: net.Stream) !void {
