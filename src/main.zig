@@ -2,19 +2,22 @@ const std = @import("std");
 const yazap = @import("yazap");
 
 const net = std.net;
-const posix = std.posix;
 const print = std.debug.print;
 const Thread = std.Thread;
 const ArrayList = std.ArrayList;
 const Random = std.Random;
+const stdout_stream = std.io.getStdOut().writer();
 
+//default listen port
 const PORT = 8881;
+
 const BUFFER_SIZE = 1500;
 
 const App = yazap.App;
 const Arg = yazap.Arg;
 
 var blocked_sites: ?[][]u8 = null;
+
 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 const allocator = arena.allocator();
 
@@ -39,23 +42,31 @@ const ConnectionPair = struct {
 pub fn main() !void {
     defer arena.deinit();
 
-    var port_listen: u32 = PORT;
+    var listen_port: u16 = PORT;
+    var iface: ?[]const u8 = null;
+
     var app = App.init(allocator, "nodpiz", "NoDPIZ proxy");
     defer app.deinit();
     var nodpiz = app.rootCommand();
+    //option -h
     try nodpiz.addArg(Arg.booleanOption("help", 'h', "Display help"));
+    //option -v
     try nodpiz.addArg(Arg.booleanOption("version", 'v', "Display version"));
 
+    //option -b <blacklist>
     var blacklist_opt = Arg.singleValueOption("blacklist", 'b', "blacklist file with hosts to bypass,optional, default \n is bypass to all hosts");
     blacklist_opt.setValuePlaceholder("BLACKLIST_FILE");
 
+    //option -p <port>
     var port_opt = Arg.singleValueOption("port", 'p', "Port Listening,optional, default is 8881");
     port_opt.setValuePlaceholder("TCP_PORT");
 
+    //option -i <iface>
     var iface_opt = Arg.singleValueOption("iface", 'i', "interface listening, ex: 127.0.0.1 or 0.0.0.0, optional,default is 127.0.0.1");
     iface_opt.setValuePlaceholder("IFACE");
 
     try nodpiz.addArgs(&[_]Arg{ blacklist_opt, port_opt, iface_opt });
+
     const matches = try app.parseProcess();
 
     if (matches.containsArg("version")) {
@@ -67,24 +78,33 @@ pub fn main() !void {
         return;
     }
     if (matches.getSingleValue("blacklist")) |blacklist_file_name| {
-        try loadBlacklist(allocator, blacklist_file_name);
-        // return;
+        loadBlacklist(allocator, blacklist_file_name) catch |err| {
+            print("Не удалось загрузить {s} {}\n", .{ blacklist_file_name, err });
+            @panic("Не удалось загрузить файл со списком хостов!");
+        };
     }
     if (matches.getSingleValue("port")) |port_str| {
         // print("port : {s}\n", .{port});
-        port_listen = try std.fmt.parseUnsigned(u32, port_str, 10);
-        if (port_listen < 1024) {
-            return error.InvalidWordCount;
+        listen_port = try std.fmt.parseUnsigned(u16, port_str, 10);
+
+        if (listen_port < 1024) {
+            return error.InvalidTCPPort;
         }
-        print("port_listen:{d}\n", .{port_listen});
-        // return;
+        // print("port_listen:{d}\n", .{port_listen});
+    } else {
+        listen_port = 8881;
     }
+
     if (matches.getSingleValue("iface")) |iface_str| {
-        // print("port : {s}\n", .{port});
-        print("interface listen:{s}\n", .{iface_str});
-        return;
+        // print("interface listen:{s}\n", .{iface_str});
+        // print("{s}\n", .{@typeName(@TypeOf(iface_str))});
+        iface = try allocator.dupe(u8, iface_str);
+    } else {
+        iface = "127.0.0.1";
     }
+
     // Инициализация генератора случайных чисел
+
     var prng = Random.DefaultPrng.init(blk: {
         var seed: u64 = undefined;
         std.posix.getrandom(std.mem.asBytes(&seed)) catch @panic("Failed to get random seed");
@@ -92,11 +112,16 @@ pub fn main() !void {
     });
     random = prng.random();
     // Запуск прокси сервера
-    try startProxy();
+    // print("Daemon listen on: {s}:{d}\n", .{ iface.?, listen_port });
+    // try startProxy();
+    try startProxy(iface.?, listen_port);
 }
 
-fn startProxy() !void {
-    const address = try net.Address.parseIp4("127.0.0.1", PORT);
+fn startProxy(listen_iface: []const u8, listen_port: u16) !void {
+    print("startProxy.Daemon listen on: {s}:{d}\n", .{ listen_iface, listen_port });
+
+    // const address = try net.Address.parseIp4("127.0.0.1", PORT);
+    const address = net.Address.parseIp4(listen_iface, listen_port) catch @panic("Can't parse address");
 
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -243,8 +268,24 @@ fn fragmentData(local_stream: net.Stream, remote_stream: net.Stream) !void {
     };
 
     const data = data_buffer[0..data_bytes];
+    // Проверка на заблокированные сайты
+    if (blocked_sites) |sites| {
+        var is_blocked = false;
+        for (sites) |site| {
+            if (std.mem.indexOf(u8, data, site) != null) {
+                is_blocked = true;
+                break;
+            }
+        }
 
-    // Фрагментация данных
+        if (!is_blocked) {
+            // Отправляем данные как есть
+            _ = try remote_stream.writeAll(&head_buffer);
+            _ = try remote_stream.writeAll(data);
+            return;
+        }
+    }
+    // // Фрагментация данных
     var parts = ArrayList(u8).init(allocator);
     defer parts.deinit();
 
@@ -270,7 +311,7 @@ fn fragmentData(local_stream: net.Stream, remote_stream: net.Stream) !void {
 
 fn loadBlacklist(alloc: std.mem.Allocator, blacklist_file_name: []const u8) !void {
     // Освобождаем предыдущий список сайтов
-    print("loadBlacklist.blacklist_file_name:{s}\n", .{blacklist_file_name});
+    // print("loadBlacklist.blacklist_file_name:{s}\n", .{blacklist_file_name});
     if (blocked_sites) |sites| {
         for (sites) |site| alloc.free(site);
         alloc.free(sites);
@@ -298,7 +339,7 @@ fn loadBlacklist(alloc: std.mem.Allocator, blacklist_file_name: []const u8) !voi
         const trimmed = std.mem.trim(u8, line, " \t");
         if (trimmed.len == 0) continue;
 
-        print("loadBlacklist.trimmed:{s}\n", .{trimmed});
+        print("loadBlacklist:{s}\n", .{trimmed});
         const site_copy = try alloc.dupe(u8, trimmed);
         errdefer alloc.free(site_copy); // Освобождение при ошибке
 
@@ -306,4 +347,10 @@ fn loadBlacklist(alloc: std.mem.Allocator, blacklist_file_name: []const u8) !voi
     }
 
     blocked_sites = try sites.toOwnedSlice();
+}
+inline fn debugPrint(debug: bool, comptime fmt_str: []const u8, args: anytype) !void {
+    if (debug) {
+        try stdout_stream.print("DEBUG: ", .{});
+        try stdout_stream.print(fmt_str, args);
+    }
 }
