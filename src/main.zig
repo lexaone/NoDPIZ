@@ -157,6 +157,9 @@ fn startProxy(listen_iface: []const u8, listen_port: u16) !void {
 }
 
 fn handleConnection(local_stream: net.Stream) !void {
+    var arena_local = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_local.deinit();
+    const allocator_local = arena_local.allocator();
     defer local_stream.close();
 
     var buffer: [BUFFER_SIZE]u8 = undefined;
@@ -204,7 +207,7 @@ fn handleConnection(local_stream: net.Stream) !void {
         if (net.Address.parseIp(host, port)) |addr| {
             break :blk addr;
         } else |_| {
-            const list = try net.getAddressList(allocator, host, port);
+            const list = try net.getAddressList(allocator_local, host, port);
             defer list.deinit();
             if (list.addrs.len == 0) return error.NoAddressFound;
             break :blk list.addrs[0];
